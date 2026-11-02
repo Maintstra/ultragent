@@ -1,0 +1,6 @@
+{
+  "name": "ultragent",
+  "version": "0.1.0",
+  "description": "Hand coding tasks to ultragent, a local budget-capped worker on your Claude API credits",
+  "license": "MIT"
+}

@@ -1,0 +1,11 @@
+{
+  "name": "ultragent-marketplace",
+  "owner": { "name": "U Design Studio" },
+  "plugins": [
+    {
+      "name": "ultragent",
+      "source": "./plugins/ultragent",
+      "description": "Hand coding tasks to ultragent, a local budget-capped worker on your Claude API credits"
+    }
+  ]
+}
