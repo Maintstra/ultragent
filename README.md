@@ -1,10 +1,14 @@
 # ultragent
 
+English | [简体中文](README.zh-CN.md)
+
+Claude Max and Ultra plans include monthly API credits (Max US$100, Ultra US$200, claimed under claude.ai Settings → Billing → API credits → Link organization) that cannot be used in Claude Code. ultragent lets you spend them on real coding work locally, with a hard cap.
+
 Give a Markdown brief to a coding agent that runs on your own machine, inside one directory, under a USD budget and a tool guard. It writes a report and stops.
 
 ```
-npx ultragent init
-npx ultragent run brief.md
+ultragent init
+ultragent run brief.md
 ```
 
 Not affiliated with or endorsed by Anthropic. You need your own Claude API key.
@@ -13,20 +17,22 @@ Not affiliated with or endorsed by Anthropic. You need your own Claude API key.
 
 - **Local.** The agent runs on your machine, in the directory you point it at. Your code is not copied anywhere except to the model API as part of normal tool use.
 - **Direct API.** ultragent calls the Claude Messages API with `@anthropic-ai/sdk` and runs its own tool loop. It does not use the Claude Code binary or the Claude Agent SDK, so usage is billed as ordinary API usage on your `ANTHROPIC_API_KEY`.
-- **Hard per-task USD cap.** It adds up the estimated cost of every response and stops when the total reaches the budget (default 1 for `ultragent run`, maximum 50). See "Cost and budget" for how the estimate works and where it can overshoot.
+- **Hard monthly USD cap (local).** A cap on month-to-date spend, enforced from `costs.csv` before every run (default 100; see "Monthly cap").
+- **Hard per-task USD cap.** It adds up the estimated cost of every response and stops when the total reaches the budget (default 1 for `ultragent run`, or your `default-budget` setting; maximum 50). See "Cost and budget" for how the estimate works and where it can overshoot.
 - **Key isolation.** The key is stored in `~/.ultragent/.env` and passed only to the API client. It is not exported to your shell.
 - **Cost log.** Every run appends a line to `~/.ultragent/costs.csv`: finish time, brief name, model, outcome, turns, minutes, cost in USD.
 
 ## Quick start
 
-Requires Node 18 or newer. No clone or install step is needed.
+Requires Node 18 or newer. Install it once from GitHub:
 
 ```
-npx ultragent init     # asks for your key (hidden input), saves it, runs a dry check
-npx ultragent run brief.md
+npm install -g github:Maintstra/ultragent
+ultragent init     # asks for your key (hidden input), saves it, runs a dry check
+ultragent run brief.md
 ```
 
-`init` prompts `Paste your Claude API key (input hidden):`, checks that it starts with `sk-ant-`, saves it and runs a dry check (one turn, no tools, about US$0.005). It never prints the key; it shows only "…" and the last 4 characters. If a key is already saved it asks before replacing it.
+`init` prompts `Paste your Claude API key (input hidden):`, checks that it starts with `sk-ant-`, saves it, asks which plan you are on (see "Monthly cap") and runs a dry check (one turn, no tools, about US$0.005). It never prints the key; it shows only "…" and the last 4 characters. If a key is already saved it asks before replacing it.
 
 Commands:
 
@@ -34,7 +40,8 @@ Commands:
 ultragent init
 ultragent run <brief.md> [--cwd .] [--budget 1] [--model ...] [--max-turns N] [--report path] [--allow-dir path]
 ultragent check        # dry check only (about US$0.005)
-ultragent costs        # last 10 rows of costs.csv as a table, plus the month-to-date total
+ultragent costs        # last 10 rows of costs.csv as a table, plus the month-to-date total, the cap and what is left
+ultragent config       # show settings; "config set monthly-cap <usd>" / "config set default-budget <usd>" change them
 ultragent --help       # or: ultragent <command> --help
 ```
 
@@ -49,6 +56,7 @@ Outcomes: `success`, `error_max_turns`, `error_max_budget_usd`, `refusal`, `erro
 | `~/.ultragent/.env` | `ANTHROPIC_API_KEY=...` (directory mode 0700, file mode 0600; on Windows chmod is best effort) |
 | `~/.ultragent/runs/<timestamp>-<brief name>/` | `events.jsonl` (start, each turn with usage and running cost, each tool call, blocked calls, errors, result) and the default `report.md` |
 | `~/.ultragent/costs.csv` | one line per run |
+| `~/.ultragent/config.json` | local settings: `monthlyCap`, `defaultBudget` (file mode 0600) |
 
 Set `ULTRAGENT_HOME` to use another directory. For the old development setup, if a `.env` exists in the package root and `~/.ultragent/.env` does not, the key is read from the package-root file (it is not copied or moved). `AGENT_WORKER_ENV` still overrides the key file path.
 
@@ -58,7 +66,7 @@ Set `ULTRAGENT_HOME` to use another directory. For the old development setup, if
 | --- | --- | --- |
 | `<brief.md>` | required | Markdown brief to run. |
 | `--cwd <path>` | current directory | Directory the agent works in. |
-| `--budget <usd>` | `1` | Hard cost cap for the run. Must be above 0 and at most 50. |
+| `--budget <usd>` | `default-budget` setting (`1`) | Hard cost cap for the run. Must be above 0 and at most 50. Also limited by the monthly cap. |
 | `--model <id>` | `claude-sonnet-5-5` | Model ID. Must be in the `PRICES` table in `src/worker.mjs`; any other model is rejected at startup. |
 | `--max-turns <n>` | `200` | Maximum number of API responses. |
 | `--report <path>` | `report.md` in the run directory | Where the agent is told to write its report. Its directory becomes writable. |
@@ -69,6 +77,36 @@ Unknown flags cause an error.
 ### Developing from a clone
 
 `node worker.mjs --brief brief.md --cwd path/to/repo [--budget 5] [--dry-check] ...` still works as a thin wrapper over the same code (its default budget is 5, and it needs `--brief` and `--cwd` unless `--dry-check`). `npm test` runs the guard tests and the CLI tests; `npm run check` runs the dry check.
+
+## Monthly cap
+
+Plan-included API credits differ by plan (see Anthropic's "API credits for Max, Ultra, and Team plans" page):
+
+| Plan | Included API credit |
+| --- | --- |
+| Max | US$100 per month |
+| Ultra | US$200 per month |
+
+An API key cannot tell ultragent which plan you are on or how much credit is left, so you set a local monthly cap and ultragent enforces it from `costs.csv`.
+
+```
+ultragent config                          # print the current settings
+ultragent config set monthly-cap 200      # US$ per UTC month; 0 = no local cap
+ultragent config set default-budget 2     # budget for "run" without --budget (above 0, at most 50)
+```
+
+Settings are saved in `~/.ultragent/config.json` (mode 0600; same home rules as the key, so `ULTRAGENT_HOME` applies). Invalid values are rejected and nothing is saved.
+
+| Setting | Default |
+| --- | --- |
+| `monthly-cap` | `100` (US$; `0` = no local cap) |
+| `default-budget` | `1` (US$) |
+
+- `init` asks "Which plan are you on? [1] Max (US$100/month credit) [2] Ultra (US$200/month) [3] Other / set my own cap" and sets `monthly-cap` to 100, 200 or the number you type. An empty answer, or piped input that ends, keeps the current cap (100 unless you changed it).
+- `run` first adds up this month's spend (current UTC month, from `costs.csv`). If that plus the run's `--budget` is over the cap, it refuses before any API call and says what was spent, what the cap is and how to change it (exit code 2). Otherwise it passes `min(--budget, cap - month-to-date)` as the effective budget, so one run can never cross the cap.
+- `costs` also shows the cap and the amount remaining.
+
+**Honest note:** ultragent only counts what it spent itself; usage from other apps on the same key is not included. Set a spend limit in the Console as well. The amounts are estimates from the local price table (see below), not the invoice.
 
 ## Cost and budget
 
@@ -144,9 +182,9 @@ This repo is also a Claude Code plugin marketplace. Install the plugin inside Cl
 /plugin install ultragent@ultragent-marketplace
 ```
 
-Then ask Claude Code to hand a task off (for example `/ultragent:ultragent add input validation to the signup form`, or "use ultragent for this"). The skill makes Claude Code the manager: it writes a brief to `.ultragent/briefs/`, runs `npx ultragent run` with a USD budget (default 1), waits, then reads the report, checks `git diff` and `git status`, runs your tests and reviews the change. The coding itself is done by ultragent on your API key. If no key is set, the skill tells you to run `npx ultragent init` in your own terminal; it never asks for the key in chat.
+Then ask Claude Code to hand a task off (for example `/ultragent:ultragent add input validation to the signup form`, or "use ultragent for this"). The skill makes Claude Code the manager: it writes a brief to `.ultragent/briefs/`, runs `ultragent run` with a USD budget (default 1), waits, then reads the report, checks `git diff` and `git status`, runs your tests and reviews the change. The coding itself is done by ultragent on your API key. If no key is set, the skill tells you to run `ultragent init` in your own terminal; it never asks for the key in chat.
 
-The skill's `allowed-tools` pre-approves only `npx ultragent`, `git diff` and `git status` for that turn. Other commands (such as running your tests) still go through the normal permission prompts. The plugin files live in `.claude-plugin/` and `plugins/` and are not part of the npm package.
+The skill's `allowed-tools` pre-approves only `ultragent`, `git diff` and `git status` for that turn. Other commands (such as running your tests) still go through the normal permission prompts. The plugin files live in `.claude-plugin/` and `plugins/` and are not part of the npm package.
 
 
 ## Agent SDK variant

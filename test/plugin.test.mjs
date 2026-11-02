@@ -40,6 +40,6 @@ test('SKILL.md has frontmatter with name, description and allowed-tools', () => 
   );
   assert.equal(fm.name, 'ultragent');
   assert.ok(fm.description && fm.description.length > 20);
-  assert.ok(fm['allowed-tools'].includes('Bash(npx ultragent *)'));
+  assert.ok(fm['allowed-tools'].includes('Bash(ultragent *)'));
   assert.doesNotMatch(fm.name, banned);
 });
