@@ -1,6 +1,6 @@
 // Per-user configuration: key file, run logs and cost log live outside the package
 // (npx installs into a cache), by default in ~/.ultragent/.
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -121,6 +121,26 @@ export function readCostRows() {
 export function monthToDate(now = new Date()) {
   const y = now.getUTCFullYear();
   const m = now.getUTCMonth();
-  const rows = readCostRows().filter((r) => { const d = new Date(r.at); return d.getUTCFullYear() === y && d.getUTCMonth() === m && Number.isFinite(r.cost); });
-  return { total: rows.reduce((sum, r) => sum + r.cost, 0), runs: rows.length, label: `${y}-${String(m + 1).padStart(2, '0')}` };
+  const inMonth = (at) => { const d = new Date(at); return d.getUTCFullYear() === y && d.getUTCMonth() === m; };
+  const rows = readCostRows().filter((r) => inMonth(r.at) && Number.isFinite(r.cost));
+  // Runs that were killed never reach costs.csv; count their last live cost too.
+  const unfinished = unfinishedRunCosts().filter((r) => inMonth(r.at));
+  const total = rows.reduce((sum, r) => sum + r.cost, 0) + unfinished.reduce((sum, r) => sum + r.cost, 0);
+  return { total, runs: rows.length + unfinished.length, unfinished: unfinished.length, label: `${y}-${String(m + 1).padStart(2, '0')}` };
+}
+
+export function unfinishedRunCosts() {
+  const dir = runsDir();
+  if (!existsSync(dir)) return [];
+  const out = [];
+  for (const name of readdirSync(dir)) {
+    const file = join(dir, name, 'cost.json');
+    if (!existsSync(file)) continue;
+    try {
+      const c = JSON.parse(readFileSync(file, 'utf8'));
+      if (c.final || !Number.isFinite(c.cost)) continue;
+      out.push({ at: statSync(file).mtime.toISOString(), cost: c.cost, run: name });
+    } catch { /* ignore a half-written file */ }
+  }
+  return out;
 }

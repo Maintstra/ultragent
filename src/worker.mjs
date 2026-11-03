@@ -3,8 +3,8 @@
 // under a USD budget and a tool guard, then writes a report and stops.
 // Exports runWorker(options); bin/ultragent.mjs and the root worker.mjs wrapper call it.
 
-import { spawnSync } from 'node:child_process';
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { spawn, spawnSync } from 'node:child_process';
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, extname, join, resolve } from 'node:path';
 import { makeGuard } from './guard.mjs';
 import { costsPath, ensureHome, loadKey, runsDir } from './config.mjs';
@@ -16,7 +16,8 @@ const PRICES = {
   'claude-haiku-5-5': [0.1, 0.5, 0.01],
 };
 const MAX_TOOL_OUTPUT = 30_000;
-const COMMAND_TIMEOUT_MS = 10 * 60 * 1000;
+export const DEFAULT_COMMAND_TIMEOUT_SEC = 120;
+export const STEER_FILE = 'steer.md';
 export const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 export const CONTEXT_LIMIT_TOKENS = 700_000;
 export const CLEAR_OLD_TOOL_RESULTS = Object.freeze({
@@ -53,10 +54,12 @@ function normalize(options) {
     budget: options.budget ?? 5,
     model: options.model ?? 'claude-sonnet-5-5',
     maxTurns: options.maxTurns ?? 200,
+    commandTimeout: options.commandTimeout ?? DEFAULT_COMMAND_TIMEOUT_SEC,
   };
   if (!out.dryCheck && (!out.brief || !out.cwd)) throw new Error('--brief and --cwd are required');
   if (!(out.budget > 0 && out.budget <= 50)) throw new Error('--budget must be between 0 and 50 USD');
   if (!(Number.isInteger(out.maxTurns) && out.maxTurns > 0)) throw new Error('--max-turns must be a positive integer');
+  if (!(out.commandTimeout >= 5 && out.commandTimeout <= 3600)) throw new Error('--command-timeout must be between 5 and 3600 seconds');
   if (!PRICES[out.model]) throw new Error(`No price table for ${out.model}; add it to PRICES first`);
   return out;
 }
@@ -81,11 +84,49 @@ function findShell() {
   return { file: 'powershell.exe', args: (c) => ['-NoProfile', '-NonInteractive', '-Command', c] };
 }
 
-function runCommand(shell, command, cwd) {
-  const r = spawnSync(shell.file, shell.args(command), { cwd, encoding: 'utf8', timeout: COMMAND_TIMEOUT_MS, maxBuffer: 64 * 1024 * 1024 });
-  if (r.error) return { text: `error: ${r.error.message}`, isError: true };
-  const text = [r.stdout, r.stderr].filter(Boolean).join(r.stdout && r.stderr ? '\n[stderr]\n' : '') || '(no output)';
-  return { text: clip(`${text}\n[exit code ${r.status ?? 'killed'}]`), isError: r.status !== 0 };
+// Async so a hung grandchild (for example grep holding the pipe) cannot block the worker:
+// on timeout the whole process tree is killed and the worker resumes with what it has.
+export function runCommand(shell, command, cwd, timeoutSec = DEFAULT_COMMAND_TIMEOUT_SEC) {
+  return new Promise((done) => {
+    const child = spawn(shell.file, shell.args(command), { cwd, detached: process.platform !== 'win32', windowsHide: true });
+    let out = '';
+    let err = '';
+    let finished = false;
+    const cap = (s, chunk) => (s.length > 64 * 1024 * 1024 ? s : s + chunk);
+    child.stdout.on('data', (c) => { out = cap(out, c.toString('utf8')); });
+    child.stderr.on('data', (c) => { err = cap(err, c.toString('utf8')); });
+    const finish = (status, note = '') => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      const text = [out, err].filter(Boolean).join(out && err ? '\n[stderr]\n' : '') || '(no output)';
+      done({ text: clip(`${text}${note}\n[exit code ${status ?? 'killed'}]`), isError: status !== 0 });
+    };
+    const timer = setTimeout(() => {
+      killTree(child.pid);
+      finish(null, `\n[timed out after ${timeoutSec}s; the command and its child processes were stopped. Narrow the command (smaller directory, --include filters) or add your own timeout.]`);
+    }, timeoutSec * 1000);
+    child.on('error', (e) => { finished = true; clearTimeout(timer); done({ text: `error: ${e.message}`, isError: true }); });
+    child.on('close', (code) => finish(code));
+  });
+}
+
+function killTree(pid) {
+  if (!pid) return;
+  try {
+    if (process.platform === 'win32') spawnSync('taskkill', ['/T', '/F', '/PID', String(pid)], { windowsHide: true });
+    else process.kill(-pid, 'SIGKILL');
+  } catch { /* already gone */ }
+}
+
+// A manager can steer a running worker: text written to <runDir>/steer.md is delivered with the
+// next tool results, then the file is renamed so each note is delivered once.
+export function takeSteer(runDir, seq) {
+  const path = join(runDir, STEER_FILE);
+  if (!existsSync(path)) return null;
+  const text = readFileSync(path, 'utf8').trim();
+  renameSync(path, join(runDir, `steer-${seq}.delivered.md`));
+  return text || null;
 }
 
 // Client-side implementation of the text_editor_20250728 tool.
@@ -208,9 +249,9 @@ function projectInstructions(cwd) {
   return parts.join('\n\n');
 }
 
-function systemPrompt(cwd, shell) {
+function systemPrompt(cwd, shell, timeoutSec = DEFAULT_COMMAND_TIMEOUT_SEC) {
   return `You are a background coding worker. A manager wrote the task brief and will review your work.
-Environment: ${process.platform}, repository root ${cwd}. Each bash call starts fresh in the repository root (shell: ${basename(shell.file)}); use paths relative to it or absolute paths.
+Environment: ${process.platform}, repository root ${cwd}. Each bash call starts fresh in the repository root (shell: ${basename(shell.file)}); use paths relative to it or absolute paths. Each command is stopped after ${timeoutSec}s; keep searches narrow (no recursive grep over huge trees).
 Rules:
 - Work only inside the repository. Follow its project instructions below.
 - Do not push, publish, deploy, send messages, download from the network or touch credentials or .env files. If the brief needs that, stop and say so in the report.
@@ -265,7 +306,7 @@ export async function runWorker(options) {
       ? 'Reply with the single word READY. Do not use any tools.'
       : `${readFileSync(briefPath, 'utf8')}\n\n---\nRepository: ${cwd}\nWrite your final report to: ${reportPath}`,
   }];
-  const system = systemPrompt(cwd, shell);
+  const system = systemPrompt(cwd, shell, args.commandTimeout);
 
   let cost = 0;
   let turns = 0;
@@ -294,6 +335,7 @@ export async function runWorker(options) {
       lastText = response.content.filter((b) => b.type === 'text').map((b) => b.text).join('\n') || lastText;
       messages.push({ role: 'assistant', content: response.content });
       log({ event: 'turn', turn: turns, stop: response.stop_reason, cost: Number(cost.toFixed(4)), usage: response.usage });
+      writeFileSync(join(runDir, 'cost.json'), JSON.stringify({ cost: Number(cost.toFixed(4)), turns, final: false }));
 
       if (response.stop_reason === 'refusal') { outcome = 'refusal'; break; }
       if (response.stop_reason === 'pause_turn') continue;
@@ -312,7 +354,7 @@ export async function runWorker(options) {
         let res;
         if (call.name === 'bash') {
           const why = input.restart ? null : guard('Bash', { command: input.command });
-          res = input.restart ? { text: 'Each command already runs in a fresh shell.' } : why ? { text: `Blocked: ${why}`, isError: true } : runCommand(shell, String(input.command ?? ''), cwd);
+          res = input.restart ? { text: 'Each command already runs in a fresh shell.' } : why ? { text: `Blocked: ${why}`, isError: true } : await runCommand(shell, String(input.command ?? ''), cwd, args.commandTimeout);
           log({ event: why ? 'blocked' : 'tool', name: 'bash', input: String(input.command ?? '').slice(0, 300), why: why ?? undefined });
         } else if (call.name === 'str_replace_based_edit_tool') {
           const path = resolve(cwd, String(input.path ?? ''));
@@ -328,6 +370,11 @@ export async function runWorker(options) {
         }
         results.push({ type: 'tool_result', tool_use_id: call.id, content: res.text, is_error: res.isError || undefined });
       }
+      const note = takeSteer(runDir, turns);
+      if (note) {
+        results.push({ type: 'text', text: `[Manager note while you work - follow it]\n${note}` });
+        log({ event: 'steer', text: note.slice(0, 300) });
+      }
       messages.push({ role: 'user', content: results });
     }
   } catch (err) {
@@ -338,6 +385,7 @@ export async function runWorker(options) {
 
   const minutes = (Date.now() - started) / 60000;
   log({ event: 'result', outcome, cost: Number(cost.toFixed(4)), turns, minutes: Number(minutes.toFixed(1)) });
+  writeFileSync(join(runDir, 'cost.json'), JSON.stringify({ cost: Number(cost.toFixed(4)), turns, final: true }));
   const costsCsv = costsPath();
   if (!existsSync(costsCsv)) writeFileSync(costsCsv, 'finished_at,brief,model,outcome,turns,minutes,cost_usd\n');
   appendFileSync(costsCsv, [new Date().toISOString(), briefPath ? basename(briefPath) : 'dry-check', args.model, outcome,

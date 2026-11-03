@@ -71,8 +71,17 @@ ultragent --help       # or: ultragent <command> --help
 | `--max-turns <n>` | `200` | API 响应的最大轮数。 |
 | `--report <path>` | 运行目录里的 `report.md` | 告诉代理把报告写到哪里。该目录会变成可写。 |
 | `--allow-dir <path>` | 无 | 额外的可写目录，可以重复指定。 |
+| `--command-timeout <s>` | `120` | 单条 shell 命令运行超过这个秒数（5–3600），就连同它启动的所有子进程一起停掉。代理会拿到已有的输出和一条说明，然后继续工作。 |
 
 未知参数会报错。
+
+### 运行中提醒
+
+```bash
+ultragent steer "别再手动摸索了，现在开始写测试脚本。"
+```
+
+这条提醒会写进最近一次运行目录里的 `steer.md`（也可以用 `--run <dir>` 指定目录）。worker 会在下一次拿到工具结果时一起收到它，所以不用停掉任务就能纠正方向。每条提醒只送达一次。
 
 ### 从 clone 的仓库开发
 
@@ -118,7 +127,7 @@ API 每次响应都会返回 token 用量；worker 用 `src/worker.mjs` 里的 `
 
 ultragent 跑的是手写的循环：发送消息、读取响应、在本地执行工具调用、把结果再发回去。它用了两个 Anthropic 定义的工具，由它自己实现，另外还有一个自定义工具 `view_image`（见下文）：
 
-- `bash_20250124`（`bash`）。每次调用都在一个新的 shell 里运行，起点是仓库根目录，所以 `cd` 和环境变量的修改不会带到下一次调用。在 Windows 上，如果找得到就用 Git Bash（`C:\Program Files\Git` 或 `C:\Program Files (x86)\Git` 下的 `bash.exe`），否则用 PowerShell；其他系统用 `bash`。命令运行 10 分钟后会被终止。`restart` 选项什么都不做，只会回报“每条命令本来就在新的 shell 里运行”。
+- `bash_20250124`（`bash`）。每次调用都在一个新的 shell 里运行，起点是仓库根目录，所以 `cd` 和环境变量的修改不会带到下一次调用。在 Windows 上，如果找得到就用 Git Bash（`C:\Program Files\Git` 或 `C:\Program Files (x86)\Git` 下的 `bash.exe`），否则用 PowerShell；其他系统用 `bash`。命令运行超过 `--command-timeout` 秒（默认 120），就连同它启动的子进程一起停掉，一条卡住的命令不会拖住整个任务。`restart` 选项什么都不做，只会回报“每条命令本来就在新的 shell 里运行”。
 - `text_editor_20250728`（`str_replace_based_edit_tool`）。支持 `view`（带行号的文件内容，可指定行范围；或目录列表，不含 `node_modules` 和 `.git`）、`create`、`str_replace`（旧文本必须恰好出现一次）和 `insert`。
 
 工具输出最多保留 30,000 个字符。更长的输出会保留开头和结尾各 15,000 个字符，中间加一条说明。

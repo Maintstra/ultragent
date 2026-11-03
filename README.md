@@ -71,8 +71,17 @@ Set `ULTRAGENT_HOME` to use another directory. For the old development setup, if
 | `--max-turns <n>` | `200` | Maximum number of API responses. |
 | `--report <path>` | `report.md` in the run directory | Where the agent is told to write its report. Its directory becomes writable. |
 | `--allow-dir <path>` | none | Extra writable directory. Can be given more than once. |
+| `--command-timeout <s>` | `120` | Stop a single shell command, and every process it started, after this many seconds (5 to 3600). The agent gets the output so far plus a note and carries on. |
 
 Unknown flags cause an error.
+
+### Steering a running worker
+
+```bash
+ultragent steer "Stop exploring; write the test scripts now."
+```
+
+The note goes to `steer.md` in the most recent run directory (or `--run <dir>`). The worker receives it with its next tool results, so you can correct its direction without stopping the run. Each note is delivered once.
 
 ### Developing from a clone
 
@@ -118,7 +127,7 @@ This is an estimate from a local table, not the invoice. If prices change or the
 
 Ultragent runs a manual loop: send the messages, read the response, execute the tool calls locally, send the results back. It uses two Anthropic-defined tools that it implements itself, plus one custom tool (`view_image`, below):
 
-- `bash_20250124` (`bash`). Each call runs in a fresh shell started in the repository root, so `cd` and environment changes do not carry over to the next call. On Windows it uses Git Bash (`bash.exe` under `C:\Program Files\Git` or `C:\Program Files (x86)\Git`) when found, otherwise PowerShell. Elsewhere it uses `bash`. A command is killed after 10 minutes. The `restart` option does nothing except report that every command already runs in a fresh shell.
+- `bash_20250124` (`bash`). Each call runs in a fresh shell started in the repository root, so `cd` and environment changes do not carry over to the next call. On Windows it uses Git Bash (`bash.exe` under `C:\Program Files\Git` or `C:\Program Files (x86)\Git`) when found, otherwise PowerShell. Elsewhere it uses `bash`. A command, including any child processes it started, is stopped after `--command-timeout` seconds (default 120), so one hung command cannot freeze the run. The `restart` option does nothing except report that every command already runs in a fresh shell.
 - `text_editor_20250728` (`str_replace_based_edit_tool`). Supports `view` (files with line numbers and an optional range, or a directory listing without `node_modules` and `.git`), `create`, `str_replace` (the old text must occur exactly once) and `insert`.
 
 Tool output is clipped to 30,000 characters. Longer output keeps the first and last 15,000 characters with a note in the middle.

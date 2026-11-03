@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 // ultragent CLI: init | run | check | costs | config
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { Writable } from 'node:stream';
-import { resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import {
   SETTINGS, configPath, costsPath, hasKeyFile, keyPath, loadSettings, maskKey, monthToDate, parseCap,
-  readCostRows, saveKey, saveSettings,
+  readCostRows, runsDir, saveKey, saveSettings,
 } from '../src/config.mjs';
 
 const MAIN_HELP = `ultragent - run a Markdown brief with a budget-capped, guarded coding agent on the Claude API
@@ -16,6 +16,7 @@ Usage:
   ultragent init                      Ask for your Claude API key (hidden input), save it, pick your plan, run a dry check
   ultragent run <brief.md> [options]  Run a brief in a directory under a USD budget
   ultragent check                     Dry check only (about US$0.005)
+  ultragent steer "<note>" [--run d]  Send a note to a running worker; it reads it with its next tool results
   ultragent costs                     Show the last 10 runs, the month-to-date total, the cap and what is left
   ultragent config                    Show settings; "config set monthly-cap|default-budget <usd>" changes them
 
@@ -41,8 +42,10 @@ Options:
   --max-turns <n>     Maximum number of API responses (default: 200)
   --report <path>     Where the agent writes its report (default: in the run directory)
   --allow-dir <dir>   Extra writable directory; may be repeated
+  --command-timeout <s>  Stop any single shell command (and its child processes) after this many seconds (default: 120)
   -h, --help          Show this help
 
+While it runs, "ultragent steer <note>" sends it a correction without stopping it.
 Refuses to start if month-to-date spend plus --budget would exceed the monthly cap
 (see "ultragent config"); otherwise the effective budget is min(--budget, cap - month-to-date).
 Prints a short summary (outcome, cost, turns, report path) followed by a JSON line.
@@ -52,6 +55,11 @@ Exit code: 0 on success, 1 for any other outcome, 2 if the run could not start.
 
 Sends a one-word prompt with no tools (1 turn, capped at US$0.05, typically about US$0.005)
 to verify your key and setup.
+`,
+  steer: `Usage: ultragent steer "<note>" [--run <run-dir>]
+
+Writes the note to steer.md in the run directory (default: the most recent run). The running worker
+receives it together with its next tool results, follows it, and the file is renamed so it is delivered once.
 `,
   costs: `Usage: ultragent costs
 
@@ -179,7 +187,7 @@ async function cmdCheck(args) {
 async function cmdRun(args) {
   const { values, positionals } = parse('run', args, {
     cwd: { type: 'string' }, budget: { type: 'string' }, model: { type: 'string' }, 'max-turns': { type: 'string' },
-    report: { type: 'string' }, 'allow-dir': { type: 'string', multiple: true },
+    report: { type: 'string' }, 'allow-dir': { type: 'string', multiple: true }, 'command-timeout': { type: 'string' },
   });
   if (values.help) return console.log(HELP.run);
   if (positionals.length !== 1) return fail('ultragent run needs exactly one brief file.', 1, HELP.run);
@@ -216,6 +224,7 @@ async function cmdRun(args) {
     maxTurns: values['max-turns'] === undefined ? undefined : Number(values['max-turns']),
     report: values.report,
     allowDirs: values['allow-dir'] ?? [],
+    commandTimeout: values['command-timeout'] === undefined ? undefined : Number(values['command-timeout']),
   });
   console.log(`Outcome: ${r.outcome}\nCost:    US$${r.costUsd.toFixed(4)}\nTurns:   ${r.turns}\nReport:  ${r.report}`);
   console.log(JSON.stringify({ ...r, summary: redact(r.summary) }));
@@ -248,10 +257,28 @@ function cmdCosts(args) {
   printCap(mtd);
 }
 
+function cmdSteer(args) {
+  const { values, positionals } = parse('steer', args, { run: { type: 'string' } });
+  if (values.help) return console.log(HELP.steer);
+  const note = positionals.join(' ').trim();
+  if (!note) return fail('ultragent steer needs a note.', 1, HELP.steer);
+  let dir = values.run ? resolve(values.run) : null;
+  if (!dir) {
+    const all = existsSync(runsDir()) ? readdirSync(runsDir()).filter((n) => !n.endsWith('dry-check')).sort() : [];
+    if (all.length === 0) return fail('No runs found.', 1, HELP.steer);
+    dir = join(runsDir(), all[all.length - 1]);
+  }
+  if (!existsSync(dir)) return fail(`Run directory not found: ${dir}`, 1, HELP.steer);
+  const file = join(dir, 'steer.md');
+  const previous = existsSync(file) ? readFileSync(file, 'utf8').trim() : '';
+  writeFileSync(file, previous ? `${previous}\n\n${note}\n` : `${note}\n`);
+  console.log(`Queued for ${dir}`);
+}
+
 async function main() {
   const [cmd, ...rest] = process.argv.slice(2);
   if (cmd === undefined || cmd === '--help' || cmd === '-h' || cmd === 'help') return console.log(MAIN_HELP);
-  const commands = { init: cmdInit, run: cmdRun, check: cmdCheck, costs: cmdCosts, config: cmdConfig };
+  const commands = { init: cmdInit, run: cmdRun, check: cmdCheck, steer: cmdSteer, costs: cmdCosts, config: cmdConfig };
   if (!Object.hasOwn(commands, cmd)) return fail(`Unknown command: ${cmd}`);
   try {
     await commands[cmd](rest);
