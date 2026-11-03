@@ -17,7 +17,7 @@
     "node": ">=18"
   },
   "scripts": {
-    "test": "node guard-test.mjs && node --test test/cli.test.mjs test/plugin.test.mjs",
+    "test": "node guard-test.mjs && node --test test/cli.test.mjs test/plugin.test.mjs test/view-image.test.mjs",
     "check": "node bin/ultragent.mjs check"
   },
   "keywords": [

@@ -47,7 +47,7 @@ ultragent --help       # or: ultragent <command> --help
 
 `run` prints a short summary (outcome, cost, turns, report path), then a JSON line with the outcome, cost, turns, report path, run directory and the first 300 characters of the model's last text. Exit code is 0 on `success`, 1 for any other outcome, 2 if the run fails to start (bad arguments, missing key). Unknown commands exit with 1 and print usage.
 
-Outcomes: `success`, `error_max_turns`, `error_max_budget_usd`, `refusal`, `error` (API or other exception; the message is in the summary and in `events.jsonl`).
+Outcomes: `success`, `error_max_turns`, `error_max_budget_usd`, `error_context_limit` (see "Looking at images"), `refusal`, `error` (API or other exception; the message is in the summary and in `events.jsonl`).
 
 ### Where files go
 
@@ -116,12 +116,20 @@ This is an estimate from a local table, not the invoice. If prices change or the
 
 ## How the direct worker runs tools
 
-Ultragent runs a manual loop: send the messages, read the response, execute the tool calls locally, send the results back. It uses two Anthropic-defined tools that it implements itself:
+Ultragent runs a manual loop: send the messages, read the response, execute the tool calls locally, send the results back. It uses two Anthropic-defined tools that it implements itself, plus one custom tool (`view_image`, below):
 
 - `bash_20250124` (`bash`). Each call runs in a fresh shell started in the repository root, so `cd` and environment changes do not carry over to the next call. On Windows it uses Git Bash (`bash.exe` under `C:\Program Files\Git` or `C:\Program Files (x86)\Git`) when found, otherwise PowerShell. Elsewhere it uses `bash`. A command is killed after 10 minutes. The `restart` option does nothing except report that every command already runs in a fresh shell.
 - `text_editor_20250728` (`str_replace_based_edit_tool`). Supports `view` (files with line numbers and an optional range, or a directory listing without `node_modules` and `.git`), `create`, `str_replace` (the old text must occur exactly once) and `insert`.
 
 Tool output is clipped to 30,000 characters. Longer output keeps the first and last 15,000 characters with a note in the middle.
+
+### Looking at images
+
+`view_image` (input `{ "path": string, "note"?: string }`) lets the model see a screenshot or other image, for example when running GUI tests on an Android emulator through `adb`. The guard treats it as a read: `.env` files are blocked, and the path is resolved relative to the repository like the editor tool. Supported types are `.png`, `.jpg`/`.jpeg` and `.webp`. The result is an image block plus a text line with the path, the size in pixels (when it can be read from the file header) and the size in KB. `events.jsonl` logs only the path (as `editor.view_image`), never the image data.
+
+- **5 MB limit.** A larger file is rejected with an error telling the model to downscale it first (for example `adb exec-out screencap -p` with resizing on the device side) or to view a cropped copy.
+- **Cost.** Images cost more input tokens than text, and they stay in the conversation for every later turn. The system prompt tells the model to prefer text (uiautomator dumps, logs) when that answers the question.
+- **Context stop.** If one request reports more than 700,000 input tokens (`input_tokens` + `cache_read_input_tokens` + `cache_creation_input_tokens`), the run stops with outcome `error_context_limit` and the summary says so, so a long screenshot session cannot run away. Like the budget check, it runs after the response and before its tool calls; a response that ends the turn is still `success`.
 
 If the model stops with `refusal`, the run ends as `refusal`; a `pause_turn` stop is continued automatically.
 

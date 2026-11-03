@@ -47,7 +47,7 @@ ultragent --help       # or: ultragent <command> --help
 
 `run` 会先打印一段简短的摘要（结果、成本、轮数、报告路径），再输出一行 JSON，包含结果、成本、轮数、报告路径、运行目录，以及模型最后一段文字的前 300 个字符。退出码：结果为 `success` 时是 0，其他结果是 1，运行没能启动（参数错误、缺少 key）是 2。未知命令会退出码 1 并打印用法。
 
-可能的结果：`success`、`error_max_turns`、`error_max_budget_usd`、`refusal`、`error`（API 或其他异常；错误信息在摘要和 `events.jsonl` 里）。
+可能的结果：`success`、`error_max_turns`、`error_max_budget_usd`、`error_context_limit`（见“查看图片”）、`refusal`、`error`（API 或其他异常；错误信息在摘要和 `events.jsonl` 里）。
 
 ### 文件位置
 
@@ -116,12 +116,20 @@ API 每次响应都会返回 token 用量；worker 用 `src/worker.mjs` 里的 `
 
 ## 直连 worker 如何运行工具
 
-ultragent 跑的是手写的循环：发送消息、读取响应、在本地执行工具调用、把结果再发回去。它用了两个 Anthropic 定义的工具，由它自己实现：
+ultragent 跑的是手写的循环：发送消息、读取响应、在本地执行工具调用、把结果再发回去。它用了两个 Anthropic 定义的工具，由它自己实现，另外还有一个自定义工具 `view_image`（见下文）：
 
 - `bash_20250124`（`bash`）。每次调用都在一个新的 shell 里运行，起点是仓库根目录，所以 `cd` 和环境变量的修改不会带到下一次调用。在 Windows 上，如果找得到就用 Git Bash（`C:\Program Files\Git` 或 `C:\Program Files (x86)\Git` 下的 `bash.exe`），否则用 PowerShell；其他系统用 `bash`。命令运行 10 分钟后会被终止。`restart` 选项什么都不做，只会回报“每条命令本来就在新的 shell 里运行”。
 - `text_editor_20250728`（`str_replace_based_edit_tool`）。支持 `view`（带行号的文件内容，可指定行范围；或目录列表，不含 `node_modules` 和 `.git`）、`create`、`str_replace`（旧文本必须恰好出现一次）和 `insert`。
 
 工具输出最多保留 30,000 个字符。更长的输出会保留开头和结尾各 15,000 个字符，中间加一条说明。
+
+### 查看图片
+
+`view_image`（输入 `{ "path": string, "note"?: string }`）让模型能看到截图或其他图片，例如通过 `adb` 在 Android 模拟器上跑 GUI 测试。守卫把它当作读取：`.env` 文件会被拦截，路径像编辑器工具一样相对仓库解析。支持 `.png`、`.jpg`/`.jpeg` 和 `.webp`。结果是一个图片块，加一行文字：路径、像素尺寸（能从文件头读出时）和 KB 大小。`events.jsonl` 只记录路径（`editor.view_image`），绝不记录图片数据。
+
+- **5 MB 上限。** 更大的文件会被拒绝，并提示模型先缩小（例如用 `adb exec-out screencap -p` 并在设备端缩放），或者查看裁剪后的副本。
+- **成本。** 图片比文字消耗更多输入 token，而且会留在之后每一轮的对话里。系统提示会让模型在文字（uiautomator dump、日志）能回答问题时优先用文字。
+- **上下文停止。** 如果某次请求报告的输入 token 超过 700,000（`input_tokens` + `cache_read_input_tokens` + `cache_creation_input_tokens`），运行就以 `error_context_limit` 结束，摘要里会说明，这样长时间的截图会话不会失控。和预算检查一样，它在响应之后、执行该响应的工具调用之前进行；结束这一轮的响应仍算 `success`。
 
 如果模型以 `refusal` 停止，这次运行就以 `refusal` 结束；`pause_turn` 停止则会自动继续。
 

@@ -5,7 +5,7 @@
 
 import { spawnSync } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, extname, join, resolve } from 'node:path';
 import { makeGuard } from './guard.mjs';
 import { costsPath, ensureHome, loadKey, runsDir } from './config.mjs';
 
@@ -17,6 +17,9 @@ const PRICES = {
 };
 const MAX_TOOL_OUTPUT = 30_000;
 const COMMAND_TIMEOUT_MS = 10 * 60 * 1000;
+export const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+export const CONTEXT_LIMIT_TOKENS = 700_000;
+const IMAGE_TYPES = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp' };
 
 // Legacy flag parser used by the root worker.mjs wrapper.
 export function parseArgs(argv) {
@@ -124,6 +127,72 @@ function runEditor(input, cwd) {
   }
 }
 
+// Width and height from the file header, or null when not cheaply known.
+function imageSize(buf, mediaType) {
+  try {
+    if (mediaType === 'image/png' && buf.length >= 24 && buf.toString('latin1', 12, 16) === 'IHDR') {
+      return [buf.readUInt32BE(16), buf.readUInt32BE(20)];
+    }
+    if (mediaType === 'image/jpeg' && buf[0] === 0xff && buf[1] === 0xd8) {
+      let i = 2;
+      while (i + 9 < buf.length) {
+        if (buf[i] !== 0xff) { i++; continue; }
+        const m = buf[i + 1];
+        if (m === 0xff) { i++; continue; }
+        if (m >= 0xc0 && m <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(m)) return [buf.readUInt16BE(i + 7), buf.readUInt16BE(i + 5)];
+        i += 2 + buf.readUInt16BE(i + 2);
+      }
+    }
+    if (mediaType === 'image/webp' && buf.length >= 30 && buf.toString('latin1', 0, 4) === 'RIFF' && buf.toString('latin1', 8, 12) === 'WEBP') {
+      const kind = buf.toString('latin1', 12, 16);
+      if (kind === 'VP8X') return [1 + buf.readUIntLE(24, 3), 1 + buf.readUIntLE(27, 3)];
+      if (kind === 'VP8 ') return [buf.readUInt16LE(26) & 0x3fff, buf.readUInt16LE(28) & 0x3fff];
+      if (kind === 'VP8L') {
+        const b = buf.readUInt32LE(21);
+        return [(b & 0x3fff) + 1, ((b >> 14) & 0x3fff) + 1];
+      }
+    }
+  } catch { /* fall through */ }
+  return null;
+}
+
+// Client-side custom tool view_image. Returns { content, isError } where content is a string
+// (errors) or an array of image + text blocks. The guard is applied as a Read.
+export function runViewImage(input, cwd, guard) {
+  const path = resolve(cwd, String(input.path ?? ''));
+  const why = guard('Read', { file_path: path });
+  if (why) return { path, blocked: true, content: `Blocked: ${why}`, isError: true };
+  const mediaType = IMAGE_TYPES[extname(path).toLowerCase()];
+  if (!mediaType) return { path, content: `Unsupported image type "${extname(path)}"; use .png, .jpg, .jpeg or .webp`, isError: true };
+  if (!existsSync(path) || !statSync(path).isFile()) return { path, content: `${path} does not exist or is not a file`, isError: true };
+  const bytes = statSync(path).size;
+  if (bytes > MAX_IMAGE_BYTES) {
+    return {
+      path,
+      content: `${path} is ${(bytes / 1024 / 1024).toFixed(1)} MB; the limit is 5 MB. Downscale it first (for example capture with `
+        + '`adb exec-out screencap -p` and resize on the device side, or resize with a local tool) or view a cropped copy.',
+      isError: true,
+    };
+  }
+  const buf = readFileSync(path);
+  const size = imageSize(buf, mediaType);
+  const label = `${input.path} (${size ? `${size[0]}x${size[1]}, ` : ''}${Math.max(1, Math.round(bytes / 1024))} KB)`;
+  const note = input.note ? ` ${String(input.note).slice(0, 300)}` : '';
+  return {
+    path,
+    content: [
+      { type: 'image', source: { type: 'base64', media_type: mediaType, data: buf.toString('base64') } },
+      { type: 'text', text: label + note },
+    ],
+  };
+}
+
+// Input tokens of one request, including cached ones. True when it is over the limit.
+export function contextExceeded(usage, limit = CONTEXT_LIMIT_TOKENS) {
+  const u = usage ?? {};
+  return (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) > limit;
+}
+
 function projectInstructions(cwd) {
   const parts = [];
   for (const name of ['AGENTS.md', 'CLAUDE.md']) {
@@ -140,6 +209,7 @@ Rules:
 - Work only inside the repository. Follow its project instructions below.
 - Do not push, publish, deploy, send messages, download from the network or touch credentials or .env files. If the brief needs that, stop and say so in the report.
 - Keep changes focused on the brief. Read before you edit. Run the relevant tests and typecheck before finishing.
+- Use view_image to look at screenshots or other images when you need to check layout or text visually. Prefer text (uiautomator dumps, logs) when it answers the question; images cost more.
 - If you are blocked or the brief is ambiguous, write the question in the report instead of guessing.
 - Finish by writing the report file you were given (max 30 lines): what changed (files), test results, open questions. Then reply with a one-line summary and stop calling tools.
 
@@ -170,6 +240,18 @@ export async function runWorker(options) {
   const tools = [
     { type: 'bash_20250124', name: 'bash' },
     { type: 'text_editor_20250728', name: 'str_replace_based_edit_tool', max_characters: MAX_TOOL_OUTPUT },
+    {
+      name: 'view_image',
+      description: 'Look at an image file (png, jpg, jpeg or webp, at most 5 MB), for example a screenshot. Returns the image to you.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Path to the image, relative to the repository root or absolute.' },
+          note: { type: 'string', description: 'Optional: what you want to check in the image.' },
+        },
+        required: ['path'],
+      },
+    },
   ];
   const messages = [{
     role: 'user',
@@ -204,6 +286,11 @@ export async function runWorker(options) {
       if (response.stop_reason === 'pause_turn') continue;
       const calls = response.content.filter((b) => b.type === 'tool_use');
       if (response.stop_reason === 'end_turn' || calls.length === 0) { outcome = 'success'; break; }
+      if (contextExceeded(response.usage)) {
+        outcome = 'error_context_limit';
+        lastText = `Stopped: a single request used more than ${CONTEXT_LIMIT_TOKENS.toLocaleString('en-US')} input tokens (context limit), for example after many screenshots.`;
+        break;
+      }
       if (cost >= budget) { outcome = 'error_max_budget_usd'; break; }
 
       const results = [];
@@ -219,6 +306,10 @@ export async function runWorker(options) {
           const why = guard(input.command === 'view' ? 'Read' : 'Write', { file_path: path });
           res = why ? { text: `Blocked: ${why}`, isError: true } : runEditor(input, cwd);
           log({ event: why ? 'blocked' : 'tool', name: `editor.${input.command}`, input: path, why: why ?? undefined });
+        } else if (call.name === 'view_image') {
+          const r = runViewImage(input, cwd, guard);
+          res = { text: r.content, isError: r.isError };
+          log({ event: r.blocked ? 'blocked' : 'tool', name: 'editor.view_image', tool: 'view_image', input: r.path, why: r.blocked ? r.content : undefined });
         } else {
           res = { text: `Unknown tool ${call.name}`, isError: true };
         }
