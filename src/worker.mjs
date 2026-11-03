@@ -19,6 +19,12 @@ const MAX_TOOL_OUTPUT = 30_000;
 const COMMAND_TIMEOUT_MS = 10 * 60 * 1000;
 export const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 export const CONTEXT_LIMIT_TOKENS = 700_000;
+export const CLEAR_OLD_TOOL_RESULTS = Object.freeze({
+  type: 'clear_tool_uses_20250919',
+  trigger: { type: 'input_tokens', value: 80_000 },
+  keep: { type: 'tool_uses', value: 6 },
+  clear_at_least: { type: 'input_tokens', value: 20_000 },
+});
 const IMAGE_TYPES = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp' };
 
 // Legacy flag parser used by the root worker.mjs wrapper.
@@ -269,14 +275,21 @@ export async function runWorker(options) {
   try {
     while (turns < (args.dryCheck ? 1 : args.maxTurns)) {
       turns++;
-      const response = await client.messages.create({
+      // Server-side context editing clears old tool results (screenshots included) once the
+      // prompt grows, so long GUI sessions do not pay for every old image on every turn.
+      const response = await client.beta.messages.create({
+        betas: ['context-management-2025-06-27'],
         model: args.model,
         max_tokens: 16000,
         system,
         tools,
         messages,
         cache_control: { type: 'ephemeral' },
+        context_management: { edits: [CLEAR_OLD_TOOL_RESULTS] },
       });
+      if (response.context_management?.applied_edits?.length) {
+        log({ event: 'context_cleared', edits: response.context_management.applied_edits });
+      }
       cost += costOf(args.model, response.usage);
       lastText = response.content.filter((b) => b.type === 'text').map((b) => b.text).join('\n') || lastText;
       messages.push({ role: 'assistant', content: response.content });
